@@ -6,7 +6,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 import httpx
-from pathlib import Path  # kept for compatibility
+from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 import uuid
@@ -18,13 +18,13 @@ TZ_ITALY = timezone(timedelta(hours=1))
 def now_italy():
     return datetime.now(TZ_ITALY)
 
-# ROOT_DIR removed for Koyeb
-load_dotenv()
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
 
 # MongoDB connection
-mongo_url = os.environ.get('MONGO_URL')
+mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ.get('DB_NAME', 'fas_monitor')]
+db = client[os.environ['DB_NAME']]
 
 # Create the main app
 app = FastAPI()
@@ -49,7 +49,10 @@ telegram_state = {
     "rendered_templates": {}
 }
 
-BACKEND_URL = os.environ.get('BACKEND_URL', 'https://race-monitor.preview.emergentagent.com')
+BACKEND_URL = os.environ.get('BACKEND_URL', 'https://fas-streak-alert.preview.emergentagent.com')
+
+# Lista delle 12 squadre monitorate
+TEAMS = ['SAM', 'ROM', 'UDI', 'NAP', 'INT', 'GEN', 'VER', 'ATA', 'JUV', 'LAZ', 'MIL', 'FIO']
 
 # Models
 class MatchResult(BaseModel):
@@ -745,6 +748,231 @@ async def generate_streak_daily_message_from_db(threshold):
     text += f"🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
     return text
 
+# ====== FUNZIONI PER STATISTICHE PER SQUADRA ======
+
+def build_team_history_from_records(records):
+    """Costruisce la mappa dei risultati per squadra dai record"""
+    team_results = {team: [] for team in TEAMS}
+    
+    for record in records:
+        matches = record.get("matches", [])
+        for match in matches:
+            teams_str = match.get("teams", "")
+            if not teams_str:
+                continue
+            
+            parts = teams_str.split("-")
+            if len(parts) == 2:
+                home_team = parts[0].strip().upper()
+                away_team = parts[1].strip().upper()
+                result = match.get("result", "")
+                
+                if home_team in TEAMS:
+                    team_results[home_team].append({
+                        "result": result,
+                        "giornata": record.get("giornata", "?"),
+                        "ora": record.get("ora", ""),
+                        "opponent": away_team
+                    })
+                if away_team in TEAMS:
+                    team_results[away_team].append({
+                        "result": result,
+                        "giornata": record.get("giornata", "?"),
+                        "ora": record.get("ora", ""),
+                        "opponent": home_team
+                    })
+    
+    return team_results
+
+async def generate_history_message_by_team(raw_data_only=False):
+    """Genera storico per squadra - ultimi risultati di ogni squadra"""
+    all_records = await _load_all_historical()
+    
+    if not all_records:
+        if raw_data_only:
+            return "(nessun dato)"
+        return "📋 <b>STORICO PER SQUADRA</b>\n\nNessun dato. Sincronizza con 📡 Sync."
+    
+    all_records.sort(key=lambda r: r.get("order", 0))
+    team_history = build_team_history_from_records(all_records)
+    
+    data_rows = ""
+    for team in TEAMS:
+        results = team_history.get(team, [])
+        if not results:
+            continue
+        
+        # Prendi ultimi 10 risultati
+        last_results = results[-10:]
+        icons = "".join("🟢" if r["result"] == "G" else "🔴" for r in last_results)
+        data_rows += f"<b>{team}</b>: {icons}\n"
+    
+    if raw_data_only:
+        return data_rows.strip()
+    
+    text = f"📋 <b>STORICO PER SQUADRA</b>\n━━━━━━━━━━━━━━━━━\n\n"
+    text += data_rows
+    text += f"\n🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
+    return text
+
+async def generate_info_message_by_team(threshold):
+    """Genera info per vista squadra"""
+    all_records = await _load_all_historical()
+    team_history = build_team_history_from_records(all_records)
+    
+    text = "🏆 <b>INFO PER SQUADRA</b>\n━━━━━━━━━━━━━━━━━\n\n"
+    
+    for team in TEAMS:
+        results = team_history.get(team, [])
+        if not results:
+            continue
+        
+        # Conta streak corrente
+        consecutive_ng = 0
+        consecutive_g = 0
+        total_g = 0
+        total_ng = 0
+        
+        for i in range(len(results) - 1, -1, -1):
+            if results[i]["result"] == "NG":
+                if consecutive_g == 0:
+                    consecutive_ng += 1
+                total_ng += 1
+            else:
+                if consecutive_ng == 0:
+                    consecutive_g += 1
+                total_g += 1
+        
+        if consecutive_ng >= threshold:
+            icon = "🚨"
+        elif consecutive_ng >= 4:
+            icon = "⚠️"
+        elif consecutive_ng > 0:
+            icon = "🔴"
+        else:
+            icon = "🟢"
+        
+        text += f"{icon} <b>{team}</b>: "
+        if consecutive_ng > 0:
+            text += f"<b>{consecutive_ng} NG di fila</b>"
+        else:
+            text += f"{consecutive_g}x G"
+        text += f"  [G:{total_g} NG:{total_ng}]\n"
+    
+    text += f"\n🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
+    return text
+
+async def generate_streak_message_by_team(threshold):
+    """Genera analisi streak NG per squadra"""
+    MIN_STREAK = 5
+    
+    all_records = await _load_all_historical()
+    
+    if not all_records:
+        return "🏆 <b>STREAK PER SQUADRA</b>\n\nNessun dato. Sincronizza con 📡 Sync."
+    
+    all_records.sort(key=lambda r: r.get("order", 0))
+    team_history = build_team_history_from_records(all_records)
+    
+    text = f"🏆 <b>STREAK SQUADRE (≥{MIN_STREAK})</b>\n"
+    text += f"📊 Analisi su <b>{len(all_records)}</b> giornate totali\n"
+    text += "━━━━━━━━━━━━━━━━━\n\n"
+    
+    for team in TEAMS:
+        results = team_history.get(team, [])
+        if not results:
+            continue
+        
+        streak_counts = {}
+        current_streak = 0
+        max_streak = 0
+        ongoing_streak = False
+        
+        for i, r in enumerate(results):
+            if r["result"] == "NG":
+                current_streak += 1
+                if i == len(results) - 1:
+                    ongoing_streak = True
+                    if current_streak > max_streak:
+                        max_streak = current_streak
+            else:
+                if current_streak >= MIN_STREAK:
+                    streak_counts[current_streak] = streak_counts.get(current_streak, 0) + 1
+                if current_streak > max_streak:
+                    max_streak = current_streak
+                current_streak = 0
+        
+        if current_streak >= MIN_STREAK and ongoing_streak:
+            streak_counts[current_streak] = streak_counts.get(current_streak, 0) + 1
+        
+        if streak_counts or max_streak >= MIN_STREAK:
+            text += f"🏆 <b>{team}</b>\n"
+            text += f"   Max streak: <b>{max_streak}</b> NG\n"
+            
+            if streak_counts:
+                text += f"   Occorrenze (≥{MIN_STREAK}):\n"
+                for length in sorted(streak_counts.keys(), reverse=True):
+                    count = streak_counts[length]
+                    volte = "volta" if count == 1 else "volte"
+                    text += f"   • {length} NG → <b>{count}</b> {volte}\n"
+            
+            if ongoing_streak and current_streak >= MIN_STREAK:
+                text += f"   ⚠️ <b>In corso: {current_streak} NG</b>\n"
+            
+            text += "\n"
+    
+    text += f"🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
+    return text
+
+async def generate_streak_daily_message_by_team(threshold):
+    """Genera analisi streak NG giornaliera per squadra"""
+    MIN_STREAK = 5
+    today = now_italy().strftime('%d/%m/%Y')
+    
+    cursor = db.fas_historical.find({"data_sisal": today}, {"_id": 0}).sort("order", 1)
+    today_records = await cursor.to_list(length=500)
+    
+    if not today_records:
+        return f"🏆 <b>STREAK GIORNALIERO SQUADRE</b>\n\n⚠️ Nessun dato per oggi ({today}).\n\n🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
+    
+    team_history = build_team_history_from_records(today_records)
+    
+    text = f"🏆 <b>STREAK GIORNALIERO SQUADRE (≥{MIN_STREAK})</b>\n"
+    text += f"📅 Data: <b>{today}</b>\n"
+    text += f"📊 Giornate: <b>{len(today_records)}</b>\n"
+    text += "━━━━━━━━━━━━━━━━━\n\n"
+    
+    for team in TEAMS:
+        results = team_history.get(team, [])
+        if not results:
+            continue
+        
+        current_streak = 0
+        max_streak = 0
+        ongoing_streak = False
+        
+        for i, r in enumerate(results):
+            if r["result"] == "NG":
+                current_streak += 1
+                if i == len(results) - 1:
+                    ongoing_streak = True
+                    if current_streak > max_streak:
+                        max_streak = current_streak
+            else:
+                if current_streak > max_streak:
+                    max_streak = current_streak
+                current_streak = 0
+        
+        if max_streak >= MIN_STREAK or (ongoing_streak and current_streak >= MIN_STREAK):
+            text += f"🏆 <b>{team}</b>\n"
+            text += f"   Max streak: <b>{max_streak}</b> NG\n"
+            if ongoing_streak and current_streak >= MIN_STREAK:
+                text += f"   ⚠️ <b>In corso: {current_streak} NG</b>\n"
+            text += "\n"
+    
+    text += f"🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
+    return text
+
 async def delete_message_after_delay(bot_token, chat_id, message_id, delay_seconds):
     """Cancella un messaggio dopo un certo numero di secondi"""
     import asyncio
@@ -1100,21 +1328,50 @@ async def historical_streak_analysis():
     return {"analysis": text}
 
 @api_router.get("/historical/render-history")
-async def render_history():
-    """Genera storico fresco dal DB per l'editor dell'estensione (solo dati grezzi)"""
-    text = await generate_history_message_from_db(raw_data_only=True)
+async def render_history(view: str = "serie"):
+    """Genera storico fresco dal DB per l'editor dell'estensione (solo dati grezzi)
+    view: 'serie' per posizioni 1-6, 'squadra' per le 12 squadre
+    """
+    if view == "squadra":
+        text = await generate_history_message_by_team(raw_data_only=True)
+    else:
+        text = await generate_history_message_from_db(raw_data_only=True)
     return {"text": text}
 
 @api_router.get("/historical/render-info")
-async def render_info():
-    """Genera info fresco dal DB per l'editor dell'estensione"""
-    text = await generate_info_message_from_db(telegram_state.get("threshold", 7))
+async def render_info(view: str = "serie"):
+    """Genera info fresco dal DB per l'editor dell'estensione
+    view: 'serie' per posizioni 1-6, 'squadra' per le 12 squadre
+    """
+    threshold = telegram_state.get("threshold", 7)
+    if view == "squadra":
+        text = await generate_info_message_by_team(threshold)
+    else:
+        text = await generate_info_message_from_db(threshold)
     return {"text": text}
 
 @api_router.get("/historical/render-streak")
-async def render_streak():
-    """Genera streak fresco dal DB per l'editor dell'estensione"""
-    text = await generate_streak_message_from_db(telegram_state.get("threshold", 7))
+async def render_streak(view: str = "serie"):
+    """Genera streak fresco dal DB per l'editor dell'estensione
+    view: 'serie' per posizioni 1-6, 'squadra' per le 12 squadre
+    """
+    threshold = telegram_state.get("threshold", 7)
+    if view == "squadra":
+        text = await generate_streak_message_by_team(threshold)
+    else:
+        text = await generate_streak_message_from_db(threshold)
+    return {"text": text}
+
+@api_router.get("/historical/render-streak-daily")
+async def render_streak_daily(view: str = "serie"):
+    """Genera streak giornaliero fresco dal DB
+    view: 'serie' per posizioni 1-6, 'squadra' per le 12 squadre
+    """
+    threshold = telegram_state.get("threshold", 7)
+    if view == "squadra":
+        text = await generate_streak_daily_message_by_team(threshold)
+    else:
+        text = await generate_streak_daily_message_from_db(threshold)
     return {"text": text}
 
 @api_router.delete("/historical/clear")
@@ -1128,6 +1385,75 @@ async def historical_clear(date: str = None):
         return {"deleted": result.deleted_count, "message": "Tutto lo storico cancellato"}
 
 # ====== ENDPOINT PER DOWNLOAD ESTENSIONE ======
+PUBLIC_DIR = ROOT_DIR.parent / "public"
+
+@api_router.get("/download/crx")
+async def download_crx():
+    """Scarica il file CRX dell'estensione"""
+    crx_path = PUBLIC_DIR / "fas-monitor.crx"
+    if not crx_path.exists():
+        return {"error": "File CRX non trovato"}
+    return FileResponse(
+        path=str(crx_path),
+        filename="fas-monitor-v2.3.crx",
+        media_type="application/x-chrome-extension",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+@api_router.get("/download/zip")
+async def download_zip():
+    """Scarica il file ZIP dell'estensione"""
+    zip_path = PUBLIC_DIR / "chrome-extension.zip"
+    if not zip_path.exists():
+        return {"error": "File ZIP non trovato"}
+    return FileResponse(
+        path=str(zip_path),
+        filename="fas-monitor-v4.4.zip",
+        media_type="application/zip",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+@api_router.get("/download/complete")
+async def download_complete():
+    """Scarica il pacchetto completo (backend + estensione + guida)"""
+    zip_path = PUBLIC_DIR / "fas-complete-package.zip"
+    if not zip_path.exists():
+        return {"error": "File non trovato"}
+    return FileResponse(
+        path=str(zip_path),
+        filename="fas-monitor-complete-v4.4.zip",
+        media_type="application/zip",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
+
+@api_router.get("/download/server-koyeb")
+async def download_server_koyeb():
+    """Scarica il file server.py per Koyeb"""
+    file_path = PUBLIC_DIR / "server_koyeb.py"
+    if not file_path.exists():
+        return {"error": "File non trovato"}
+    return FileResponse(
+        path=str(file_path),
+        filename="server.py",
+        media_type="text/plain",
+        headers={
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0"
+        }
+    )
 
 @api_router.get("/extension/version")
 async def extension_version():
@@ -1161,3 +1487,4 @@ async def load_telegram_state():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
+
