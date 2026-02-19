@@ -925,7 +925,7 @@ async def generate_streak_message_by_team(threshold):
     return text
 
 async def generate_streak_daily_message_by_team(threshold):
-    """Genera analisi streak NG giornaliera per squadra"""
+    """Genera analisi streak NG giornaliera per squadra - con tutte le occorrenze"""
     MIN_STREAK = 5
     today = now_italy().strftime('%d/%m/%Y')
     
@@ -947,6 +947,7 @@ async def generate_streak_daily_message_by_team(threshold):
         if not results:
             continue
         
+        streak_counts = {}  # {lunghezza_streak: numero_occorrenze}
         current_streak = 0
         max_streak = 0
         ongoing_streak = False
@@ -959,15 +960,32 @@ async def generate_streak_daily_message_by_team(threshold):
                     if current_streak > max_streak:
                         max_streak = current_streak
             else:
+                # Fine della streak
+                if current_streak >= MIN_STREAK:
+                    streak_counts[current_streak] = streak_counts.get(current_streak, 0) + 1
                 if current_streak > max_streak:
                     max_streak = current_streak
                 current_streak = 0
         
-        if max_streak >= MIN_STREAK or (ongoing_streak and current_streak >= MIN_STREAK):
+        # Se c'è una streak in corso alla fine
+        if current_streak >= MIN_STREAK and ongoing_streak:
+            streak_counts[current_streak] = streak_counts.get(current_streak, 0) + 1
+        
+        # Mostra solo se ci sono streak significative
+        if streak_counts or max_streak >= MIN_STREAK:
             text += f"🏆 <b>{team}</b>\n"
             text += f"   Max streak: <b>{max_streak}</b> NG\n"
+            
+            if streak_counts:
+                text += f"   Occorrenze (≥{MIN_STREAK}):\n"
+                for length in sorted(streak_counts.keys(), reverse=True):
+                    count = streak_counts[length]
+                    volte = "volta" if count == 1 else "volte"
+                    text += f"   • {length} NG → <b>{count}</b> {volte}\n"
+            
             if ongoing_streak and current_streak >= MIN_STREAK:
                 text += f"   ⚠️ <b>In corso: {current_streak} NG</b>\n"
+            
             text += "\n"
     
     text += f"🕐 {now_italy().strftime('%d/%m/%Y %H:%M')}"
@@ -988,7 +1006,7 @@ async def delete_message_after_delay(bot_token, chat_id, message_id, delay_secon
             logger.error(f"[Telegram] Errore cancellazione messaggio: {e}")
 
 def build_callback_keyboard():
-    """Costruisce inline keyboard con callback_data"""
+    """Costruisce inline keyboard con callback_data per SERIE"""
     return {
         "inline_keyboard": [
             [
@@ -998,6 +1016,21 @@ def build_callback_keyboard():
             [
                 {"text": "📋 Storico Ultime 15", "callback_data": "history"},
                 {"text": "ℹ️ Info", "callback_data": "info"}
+            ]
+        ]
+    }
+
+def build_callback_keyboard_team():
+    """Costruisce inline keyboard con callback_data per SQUADRE"""
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🏆 Streak Totale", "callback_data": "streak_squadra"},
+                {"text": "🏆 Streak Giornaliero", "callback_data": "streak_daily_squadra"}
+            ],
+            [
+                {"text": "🏆 Storico", "callback_data": "history_squadra"},
+                {"text": "🏆 Info", "callback_data": "info_squadra"}
             ]
         ]
     }
@@ -1171,20 +1204,36 @@ async def telegram_webhook(request: Request):
     threshold = telegram_state.get("threshold", 7)
     saved_templates = telegram_state.get("rendered_templates", {})
     
+    # Controlla se è una callback per squadra
+    is_team_view = callback_data.endswith("_squadra")
+    base_callback = callback_data.replace("_squadra", "") if is_team_view else callback_data
+    
     # Controlla se l'utente ha un template personalizzato con {data}
-    user_tpl = saved_templates.get(callback_data)
+    user_tpl = saved_templates.get(base_callback)
     use_raw_data = user_tpl and "{data}" in user_tpl
     
-    # Genera i dati freschi dal DB
-    if callback_data == "streak":
-        fresh_data = await generate_streak_message_from_db(threshold)
-    elif callback_data == "streak_daily":
-        fresh_data = await generate_streak_daily_message_from_db(threshold)
-    elif callback_data == "history":
-        fresh_data = await generate_history_message_from_db(raw_data_only=use_raw_data)
-    elif callback_data == "info":
-        fresh_data = await generate_info_message_from_db(threshold)
-    elif callback_data == "stats":
+    # Genera i dati freschi dal DB - usa la versione squadra se richiesto
+    if base_callback == "streak":
+        if is_team_view:
+            fresh_data = await generate_streak_message_by_team(threshold)
+        else:
+            fresh_data = await generate_streak_message_from_db(threshold)
+    elif base_callback == "streak_daily":
+        if is_team_view:
+            fresh_data = await generate_streak_daily_message_by_team(threshold)
+        else:
+            fresh_data = await generate_streak_daily_message_from_db(threshold)
+    elif base_callback == "history":
+        if is_team_view:
+            fresh_data = await generate_history_message_by_team(raw_data_only=use_raw_data)
+        else:
+            fresh_data = await generate_history_message_from_db(raw_data_only=use_raw_data)
+    elif base_callback == "info":
+        if is_team_view:
+            fresh_data = await generate_info_message_by_team(threshold)
+        else:
+            fresh_data = await generate_info_message_from_db(threshold)
+    elif base_callback == "stats":
         fresh_data = await generate_stats_message_from_db(threshold)
     else:
         fresh_data = "⚠️ Comando non riconosciuto"
@@ -1195,6 +1244,9 @@ async def telegram_webhook(request: Request):
         text = user_tpl.replace("{data}", fresh_data).replace("{timestamp}", ts)
     else:
         text = fresh_data
+    
+    # Costruisci keyboard appropriata (serie o squadra)
+    reply_keyboard = build_callback_keyboard_team() if is_team_view else build_callback_keyboard()
     
     async with httpx.AsyncClient() as http:
         # 1. Rispondi alla callback (rimuove l'icona di caricamento)
@@ -1210,7 +1262,7 @@ async def telegram_webhook(request: Request):
                 "chat_id": user_id,  # Invia all'utente, non al canale
                 "text": text,
                 "parse_mode": "HTML",
-                "reply_markup": build_callback_keyboard()
+                "reply_markup": reply_keyboard
             }
         )
         
@@ -1487,4 +1539,3 @@ async def load_telegram_state():
 @app.on_event("shutdown")
 async def shutdown_db_client():
     client.close()
-
