@@ -1426,6 +1426,37 @@ async def render_streak_daily(view: str = "serie"):
         text = await generate_streak_daily_message_from_db(threshold)
     return {"text": text}
 
+@api_router.get("/historical/export")
+async def historical_export():
+    """Esporta TUTTO lo storico da MongoDB per generazione Excel nell'estensione.
+    Restituisce tutti i record ordinati per data + ora, senza paginazione.
+    """
+    cursor = db.fas_historical.find({}, {"_id": 0})
+    records = await cursor.to_list(length=100000)
+
+    def sort_key(r):
+        d = r.get("data_sisal", "00/00/0000")
+        parts = d.split("/")
+        date_str = f"{parts[2]}{parts[1]}{parts[0]}" if len(parts) == 3 else d
+        ora = r.get("ora", "00:00")
+        try:
+            g = int(r.get("giornata", 0))
+        except (ValueError, TypeError):
+            g = 0
+        return (date_str, ora, g)
+
+    records.sort(key=sort_key)
+
+    total = len(records)
+    dates = list({r.get("data_sisal", "") for r in records if r.get("data_sisal")})
+    dates.sort()
+
+    return {
+        "total": total,
+        "dates": dates,
+        "records": records
+    }
+
 @api_router.delete("/historical/clear")
 async def historical_clear(date: str = None):
     """Cancella record storici. Se date specificata, cancella solo quella data"""
