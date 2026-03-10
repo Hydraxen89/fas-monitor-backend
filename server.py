@@ -1427,11 +1427,21 @@ async def render_streak_daily(view: str = "serie"):
     return {"text": text}
 
 @api_router.get("/historical/export")
-async def historical_export():
-    """Esporta TUTTO lo storico da MongoDB per generazione Excel nell'estensione.
-    Restituisce tutti i record ordinati per data + ora, senza paginazione.
+async def historical_export(month: Optional[str] = None):
+    """Esporta lo storico da MongoDB per generazione Excel nell'estensione.
+    month: filtro opzionale nel formato YYYY-MM (es. ?month=2026-02)
     """
-    cursor = db.fas_historical.find({}, {"_id": 0})
+    query = {}
+    if month:
+        # month è YYYY-MM, le date nel DB sono DD/MM/YYYY — costruiamo regex
+        parts = month.split("-")
+        if len(parts) == 2:
+            year, mon = parts[0], parts[1]
+            # Filtra: data_sisal contiene /MM/YYYY
+            import re
+            query["data_sisal"] = {"$regex": f"/{mon}/{year}$"}
+
+    cursor = db.fas_historical.find(query, {"_id": 0})
     records = await cursor.to_list(length=100000)
 
     def sort_key(r):
